@@ -44,6 +44,15 @@ jobs:
           Write-Host "Using upstream DLL: $($dll.FullName)"
           Get-FileHash 'RestFulTweaksRedux.original.dll' -Algorithm SHA256
 
+      - name: Fix source compatibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'cleaned/ModernShopCompat.cs'
+          $text = Get-Content $path -Raw
+          $text = $text.Replace('Logger.CreateLogSource(', 'BepInEx.Logging.Logger.CreateLogSource(')
+          Set-Content -Path $path -Value $text -Encoding UTF8
+
       - name: Build embedded compatibility code
         run: dotnet build cleaned/ModernShopCompat.csproj --configuration Release
 
