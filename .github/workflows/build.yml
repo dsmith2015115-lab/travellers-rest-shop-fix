@@ -1,4 +1,4 @@
-name: Build Shop Refresh Fix
+name: Build Clean Restful Tweaks Redux
 
 on:
   push:
@@ -21,30 +21,66 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Download BepInEx reference DLLs
+      - name: Download BepInEx references
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = 'https://github.com/BepInEx/BepInEx/releases/download/v5.4.23.5/BepInEx_win_x64_5.4.23.5.zip'
-          Invoke-WebRequest -Uri $url -OutFile 'bepinex.zip'
+          Invoke-WebRequest -Uri 'https://github.com/BepInEx/BepInEx/releases/download/v5.4.23.5/BepInEx_win_x64_5.4.23.5.zip' -OutFile 'bepinex.zip'
           Expand-Archive -Path 'bepinex.zip' -DestinationPath 'bepinex' -Force
           New-Item -ItemType Directory -Force 'libs' | Out-Null
           Copy-Item 'bepinex/BepInEx/core/BepInEx.dll' 'libs/BepInEx.dll'
           Copy-Item 'bepinex/BepInEx/core/0Harmony.dll' 'libs/0Harmony.dll'
-          Get-ChildItem 'libs'
 
-      - name: Build
-        run: dotnet build RestfulTweaksShopRefreshFix.csproj --configuration Release
+      - name: Download upstream Redux binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Vortox14/TravellersRestRedux/main/compiled-releases/RestFulTweaksRedux.zip' -OutFile 'redux.zip'
+          Expand-Archive -Path 'redux.zip' -DestinationPath 'redux' -Force
+          $dll = Get-ChildItem -Path 'redux' -Recurse -Filter '*.dll' | Where-Object { $_.Name -match 'Rest.*Tweaks.*Redux' } | Select-Object -First 1
+          if (-not $dll) { $dll = Get-ChildItem -Path 'redux' -Recurse -Filter '*.dll' | Select-Object -First 1 }
+          if (-not $dll) { throw 'No Redux DLL found in upstream archive.' }
+          Copy-Item $dll.FullName 'RestFulTweaksRedux.original.dll'
+          Write-Host "Using upstream DLL: $($dll.FullName)"
+          Get-FileHash 'RestFulTweaksRedux.original.dll' -Algorithm SHA256
+
+      - name: Build embedded compatibility code
+        run: dotnet build cleaned/ModernShopCompat.csproj --configuration Release
+
+      - name: Install ILRepack
+        run: dotnet tool install -g dotnet-ilrepack --version 2.0.48
+
+      - name: Merge compatibility code into Redux
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $helper = 'cleaned/bin/Release/net48/RestfulTweaks.ModernCompat.dll'
+          ilrepack /ndebug /allowdup /out:RestFulTweaksRedux.merged.dll RestFulTweaksRedux.original.dll $helper
+          if (-not (Test-Path 'RestFulTweaksRedux.merged.dll')) { throw 'ILRepack did not create merged DLL.' }
+
+      - name: Build assembly cleaner
+        run: dotnet build cleaned/Cleaner.csproj --configuration Release
+
+      - name: Patch original Redux in place
+        run: dotnet cleaned/bin/Release/net8.0/Cleaner.dll RestFulTweaksRedux.merged.dll RestFulTweaksRedux.dll
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path 'RestFulTweaksRedux.dll')) { throw 'Cleaned Redux DLL missing.' }
+          Get-Item 'RestFulTweaksRedux.dll' | Format-List Name,Length
+          Get-FileHash 'RestFulTweaksRedux.dll' -Algorithm SHA256
 
       - name: Collect DLL
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifact | Out-Null
-          Copy-Item 'bin/Release/net48/RestfulTweaksShopRefreshFix.dll' 'artifact/RestfulTweaksShopRefreshFix.dll'
+          Copy-Item 'RestFulTweaksRedux.dll' 'artifact/RestFulTweaksRedux.dll'
 
-      - name: Upload DLL
+      - name: Upload cleaned Redux DLL
         uses: actions/upload-artifact@v4
         with:
-          name: RestfulTweaksShopRefreshFix
-          path: artifact/RestfulTweaksShopRefreshFix.dll
+          name: RestFulTweaksRedux-Clean
+          path: artifact/RestFulTweaksRedux.dll
           if-no-files-found: error
