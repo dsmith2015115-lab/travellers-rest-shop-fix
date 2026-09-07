@@ -9,41 +9,33 @@ using UnityEngine;
 
 namespace TravellersRest.ShopRefreshFix
 {
-    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Refresh Fix", "1.4.0")]
+    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Refresh Fix", "1.5.0")]
     [BepInDependency("net.nep.bepinex.restfultweaks", BepInDependency.DependencyFlags.HardDependency)]
     public sealed class Plugin : BaseUnityPlugin
     {
         private const string HarmonyId = "dsmith.travellersrest.restfultweaks.shoprefreshfix";
         private static ManualLogSource Log;
-        private static Component ActiveShopUi;
-        private static GameObject RerollButton;
-        private static int pendingFrames;
-        private static object pendingContext;
-        private static readonly string[] ShopUiTypeNames = { "ShopUI", "FerroShopUI", "AnimalShopUI", "ShopBaseUI" };
+        private static bool dumpingCandidates;
 
         private void Awake()
         {
             Log = Logger;
-            Harmony harmony = new Harmony(HarmonyId);
-
             try
             {
-                MethodBase oldRefresh = FindRestfulTweaksShopRefresh();
-                if (oldRefresh != null)
+                MethodBase target = FindShopRefresh();
+                if (target != null)
                 {
-                    harmony.Patch(oldRefresh,
-                        prefix: new HarmonyMethod(typeof(Plugin).GetMethod(nameof(RestfulTweaksRefreshPrefix), BindingFlags.NonPublic | BindingFlags.Static)));
-                    Log.LogInfo("v1.4.0 patched Restful Tweaks " + oldRefresh.DeclaringType.FullName + "." + oldRefresh.Name + ".");
+                    new Harmony(HarmonyId).Patch(
+                        target,
+                        prefix: new HarmonyMethod(typeof(Plugin).GetMethod(nameof(Prefix), BindingFlags.NonPublic | BindingFlags.Static)));
+                    Log.LogInfo("v1.5.0 loaded. Patched " + target.DeclaringType.FullName + "." + target.Name + ".");
+                }
+                else
+                {
+                    Log.LogWarning("Restful Tweaks ShopRefresh() was not found. F8 seed-shop diagnostic is still available.");
                 }
 
-                int lifecycleHooks = PatchShopOpenLifecycle(harmony);
-                Log.LogInfo("v1.4.0 shop lifecycle hooks installed=" + lifecycleHooks + ". F8 is enabled as a direct reroll diagnostic.");
-
-                foreach (string typeName in ShopUiTypeNames)
-                {
-                    Type t = FindType(typeName);
-                    Log.LogInfo(t != null ? "Resolved shop UI type: " + t.FullName : "Shop UI type not found: " + typeName);
-                }
+                Log.LogInfo("Safe mode active: NO vendor OpenShopUI lifecycle hooks. Open the seed shop and press F8.");
             }
             catch (Exception e)
             {
@@ -57,414 +49,212 @@ namespace TravellersRest.ShopRefreshFix
             {
                 if (Input.GetKeyDown(KeyCode.F8))
                 {
-                    Log.LogInfo("F8 direct shop reroll requested.");
-                    DoRerollAndRefreshVisibleUi();
-                }
-
-                if (pendingFrames > 0)
-                {
-                    pendingFrames--;
-                    if (pendingFrames == 0)
-                    {
-                        Component ui = ResolveShopUiFromContext(pendingContext);
-                        pendingContext = null;
-                        if (ui != null)
-                            TryInjectRerollButton(ui);
-                        else
-                            Log.LogWarning("Shop opened, but no live ShopUI/ShopBaseUI/FerroShopUI/AnimalShopUI instance could be resolved after the open hook.");
-                    }
+                    Log.LogInfo("F8 pressed: attempting seed/farm shop reroll.");
+                    RefreshSeedShopOnly();
                 }
             }
             catch (Exception e)
             {
-                Log.LogWarning("Update diagnostic failed: " + Unwrap(e));
+                Log.LogError("F8 seed-shop reroll failed: " + Unwrap(e));
             }
         }
 
-        private static int PatchShopOpenLifecycle(Harmony harmony)
-        {
-            int count = 0;
-            MethodInfo postfix = typeof(Plugin).GetMethod(nameof(ShopOpenPostfix), BindingFlags.NonPublic | BindingFlags.Static);
-
-            foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                Type[] types;
-                try { types = asm.GetTypes(); }
-                catch { continue; }
-
-                foreach (Type t in types)
-                {
-                    MethodInfo[] methods;
-                    try { methods = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly); }
-                    catch { continue; }
-
-                    foreach (MethodInfo m in methods)
-                    {
-                        if (m.Name != "OpenShopUI")
-                            continue;
-
-                        try
-                        {
-                            harmony.Patch(m, postfix: new HarmonyMethod(postfix));
-                            count++;
-                            Log.LogInfo("Hooked shop open lifecycle: " + t.FullName + ".OpenShopUI(" + m.GetParameters().Length + " args).");
-                        }
-                        catch (Exception e)
-                        {
-                            Log.LogWarning("Could not hook " + t.FullName + ".OpenShopUI: " + e.Message);
-                        }
-                    }
-                }
-            }
-
-            return count;
-        }
-
-        private static void ShopOpenPostfix(object __instance, object[] __args, MethodBase __originalMethod)
+        private static bool Prefix()
         {
             try
             {
-                Log.LogInfo("OpenShopUI fired: " + __originalMethod.DeclaringType.FullName + "." + __originalMethod.Name + ".");
-
-                object context = __instance;
-                if (__args != null)
-                {
-                    foreach (object arg in __args)
-                    {
-                        if (arg is Component || arg is GameObject)
-                        {
-                            context = arg;
-                            break;
-                        }
-                    }
-                }
-
-                pendingContext = context;
-                pendingFrames = 2;
+                RefreshSeedShopOnly();
             }
             catch (Exception e)
             {
-                Log.LogWarning("OpenShopUI postfix failed: " + Unwrap(e));
+                Log.LogError("Restful Tweaks ShopRefresh redirect failed: " + Unwrap(e));
             }
+            return false;
         }
 
-        private static Component ResolveShopUiFromContext(object context)
+        private static void RefreshSeedShopOnly()
         {
-            Component direct = context as Component;
-            if (direct != null)
-            {
-                if (IsShopUiType(direct.GetType()))
-                {
-                    Log.LogInfo("Resolved live shop UI directly from OpenShopUI instance: " + direct.GetType().Name + ".");
-                    return direct;
-                }
+            Type accessorType = FindType("ShopDatabaseAccessor");
+            if (accessorType == null)
+                throw new MissingMemberException("ShopDatabaseAccessor not found");
 
-                Component nearby = FindShopUiInHierarchy(direct.gameObject);
-                if (nearby != null)
-                {
-                    Log.LogInfo("Resolved live shop UI near OpenShopUI owner: " + nearby.GetType().Name + " @ " + HierarchyPath(nearby.transform) + ".");
-                    return nearby;
-                }
+            object accessor = FindInstance(accessorType);
+            MethodInfo getAll = FindMethod(accessorType, "GetAllShops", 0);
+            if (getAll == null)
+                throw new MissingMethodException("ShopDatabaseAccessor.GetAllShops() not found");
+
+            List<object> shops = Values(getAll.Invoke(getAll.IsStatic ? null : accessor, null));
+            Log.LogInfo("Seed reroll scan: GetAllShops returned " + shops.Count + " record(s).");
+
+            object best = null;
+            int bestScore = 0;
+            string bestDesc = "";
+
+            foreach (object shop in shops)
+            {
+                if (shop == null)
+                    continue;
+
+                string desc;
+                int score = SeedShopScore(shop, out desc);
+                bool limited = Limited(shop);
+
+                if (score > 0 || dumpingCandidates)
+                    Log.LogInfo("Shop candidate: score=" + score + ", limited=" + limited + ", " + desc);
+
+                if (!limited || score <= bestScore)
+                    continue;
+
+                best = shop;
+                bestScore = score;
+                bestDesc = desc;
             }
 
-            GameObject go = context as GameObject;
-            if (go != null)
+            if (best == null)
             {
-                Component nearby = FindShopUiInHierarchy(go);
-                if (nearby != null)
-                    return nearby;
+                Log.LogWarning("No limited seed/farm/crop shop candidate was identified. Dumping all shop candidates once.");
+                dumpingCandidates = true;
+                foreach (object shop in shops)
+                {
+                    if (shop == null) continue;
+                    string desc;
+                    int score = SeedShopScore(shop, out desc);
+                    Log.LogInfo("Shop candidate: score=" + score + ", limited=" + Limited(shop) + ", " + desc);
+                }
+                dumpingCandidates = false;
+                return;
             }
 
-            // The open hook is the trigger; after it fires we can safely search all loaded instances,
-            // including inactive children, without polling continuously.
-            Component best = null;
-            foreach (string typeName in ShopUiTypeNames)
+            MethodInfo create = FindCreate(accessorType, best.GetType());
+            if (create == null)
+                throw new MissingMethodException("CreateNewShopList not found for " + best.GetType().FullName);
+
+            ParameterInfo[] p = create.GetParameters();
+            object[] args = new object[p.Length];
+            args[0] = best;
+            for (int i = 1; i < p.Length; i++)
+            {
+                if (p[i].HasDefaultValue) args[i] = p[i].DefaultValue;
+                else if (p[i].ParameterType == typeof(bool)) args[i] = false;
+                else if (p[i].ParameterType.IsValueType) args[i] = Activator.CreateInstance(p[i].ParameterType);
+                else args[i] = null;
+            }
+
+            Log.LogInfo("Refreshing selected seed-shop candidate: score=" + bestScore + ", " + bestDesc);
+            create.Invoke(create.IsStatic ? null : accessor, args);
+            Log.LogInfo("Seed-shop database reroll completed. Close/reopen the shop if the visible list does not update immediately.");
+
+            TrySafeVisibleRefresh();
+        }
+
+        private static int SeedShopScore(object shop, out string description)
+        {
+            Type t = shop.GetType();
+            BindingFlags f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            int score = 0;
+            List<string> clues = new List<string>();
+
+            Action<string, object> inspect = (name, value) =>
+            {
+                if (value == null) return;
+                string s = value as string;
+                if (s == null)
+                {
+                    if (value is UnityEngine.Object uo) s = uo.name;
+                    else if (value.GetType().IsEnum) s = value.ToString();
+                    else return;
+                }
+                if (string.IsNullOrEmpty(s)) return;
+
+                string hay = (name + " " + s).ToLowerInvariant();
+                int local = 0;
+                if (hay.Contains("seed")) local += 12;
+                if (hay.Contains("farm")) local += 8;
+                if (hay.Contains("crop")) local += 7;
+                if (hay.Contains("plant")) local += 4;
+                if (hay.Contains("garden")) local += 3;
+                if (local > 0)
+                {
+                    score += local;
+                    clues.Add(name + "=" + s);
+                }
+            };
+
+            foreach (FieldInfo x in t.GetFields(f))
+            {
+                try { inspect(x.Name, x.GetValue(shop)); } catch { }
+            }
+
+            foreach (PropertyInfo x in t.GetProperties(f))
+            {
+                if (x.GetIndexParameters().Length != 0 || !x.CanRead) continue;
+                try { inspect(x.Name, x.GetValue(shop, null)); } catch { }
+            }
+
+            string typeName = t.FullName ?? t.Name;
+            string lowerType = typeName.ToLowerInvariant();
+            if (lowerType.Contains("seed")) score += 12;
+            if (lowerType.Contains("farm")) score += 8;
+            if (lowerType.Contains("crop")) score += 7;
+
+            description = "type=" + typeName + (clues.Count > 0 ? ", clues=[" + string.Join(", ", clues.ToArray()) + "]" : "");
+            return score;
+        }
+
+        private static void TrySafeVisibleRefresh()
+        {
+            string[] typeNames = { "ShopUI", "ShopBaseUI" };
+            string[] methodNames = { "Refresh", "RefreshUI", "UpdateUI", "UpdateShop" };
+
+            foreach (string typeName in typeNames)
             {
                 Type t = FindType(typeName);
-                if (t == null || !typeof(Component).IsAssignableFrom(t))
-                    continue;
+                if (t == null || !typeof(Component).IsAssignableFrom(t)) continue;
 
                 UnityEngine.Object[] objects;
                 try { objects = Resources.FindObjectsOfTypeAll(t); }
                 catch { continue; }
 
-                Log.LogInfo("Post-open lookup: " + typeName + " instances=" + objects.Length + ".");
-
                 foreach (UnityEngine.Object obj in objects)
                 {
                     Component c = obj as Component;
-                    if (c == null || c.gameObject == null)
-                        continue;
+                    if (c == null || c.gameObject == null || !c.gameObject.activeInHierarchy) continue;
 
-                    Log.LogInfo("Post-open candidate: " + typeName + " active=" + c.gameObject.activeInHierarchy +
-                                " path=" + HierarchyPath(c.transform) + ".");
-
-                    if (c.gameObject.activeInHierarchy)
-                        return c;
-                    if (best == null)
-                        best = c;
-                }
-            }
-
-            return best;
-        }
-
-        private static Component FindShopUiInHierarchy(GameObject start)
-        {
-            if (start == null) return null;
-
-            Transform root = start.transform.root;
-            Component[] comps = root.GetComponentsInChildren<Component>(true);
-            foreach (Component c in comps)
-                if (c != null && IsShopUiType(c.GetType()))
-                    return c;
-
-            return null;
-        }
-
-        private static bool IsShopUiType(Type t)
-        {
-            if (t == null) return false;
-            foreach (string name in ShopUiTypeNames)
-                if (t.Name == name) return true;
-            return false;
-        }
-
-        private static void TryInjectRerollButton(Component ui)
-        {
-            if (ui == null || ui.gameObject == null)
-                return;
-
-            ActiveShopUi = ui;
-
-            if (RerollButton != null)
-            {
-                try { Destroy(RerollButton); } catch { }
-                RerollButton = null;
-            }
-
-            Component wrapper = FindVersatileButton(ui.gameObject);
-            Component unityButton = wrapper != null ? FindUnityButton(wrapper.gameObject) : FindUnityButton(ui.gameObject);
-            GameObject template = wrapper != null ? wrapper.gameObject : (unityButton != null ? unityButton.gameObject : null);
-
-            if (template == null || unityButton == null)
-            {
-                Log.LogWarning("Live " + ui.GetType().Name + " found, but it has no VersatileButton/UnityEngine.UI.Button to clone. Dumping controls.");
-                DumpControls(ui.gameObject);
-                return;
-            }
-
-            GameObject clone = Instantiate(template, template.transform.parent);
-            clone.name = "ShopRerollButton";
-
-            RectTransform srcRect = template.GetComponent<RectTransform>();
-            RectTransform dstRect = clone.GetComponent<RectTransform>();
-            if (srcRect != null && dstRect != null)
-            {
-                float h = srcRect.rect.height;
-                if (h < 1f) h = 42f;
-                dstRect.anchoredPosition = srcRect.anchoredPosition + new Vector2(0f, -(h + 8f));
-            }
-            else
-            {
-                clone.transform.localPosition += new Vector3(0f, -55f, 0f);
-            }
-
-            Component clonedButton = FindUnityButton(clone);
-            if (clonedButton == null)
-            {
-                Destroy(clone);
-                Log.LogError("Cloned template contained no UnityEngine.UI.Button.");
-                return;
-            }
-
-            RewireClick(clonedButton);
-            SetButtonLabel(clone, "Reroll");
-            clone.SetActive(true);
-            RerollButton = clone;
-
-            Log.LogInfo("Created Reroll button in live " + ui.GetType().Name + " at " + HierarchyPath(clone.transform) + ".");
-        }
-
-        private static void DumpControls(GameObject root)
-        {
-            foreach (Component c in root.GetComponentsInChildren<Component>(true))
-            {
-                if (c == null) continue;
-                string n = c.GetType().Name;
-                if (n.IndexOf("Button", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.IndexOf("Toggle", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.IndexOf("Select", StringComparison.OrdinalIgnoreCase) >= 0)
-                    Log.LogInfo("Shop control candidate: " + n + " @ " + HierarchyPath(c.transform) + ".");
-            }
-        }
-
-        private static Component FindVersatileButton(GameObject root)
-        {
-            foreach (Component c in root.GetComponentsInChildren<Component>(true))
-                if (c != null && c.gameObject.name != "ShopRerollButton" && c.GetType().Name == "VersatileButton")
-                    return c;
-            return null;
-        }
-
-        private static Component FindUnityButton(GameObject root)
-        {
-            foreach (Component c in root.GetComponentsInChildren<Component>(true))
-                if (c != null && c.GetType().FullName == "UnityEngine.UI.Button")
-                    return c;
-            return null;
-        }
-
-        private static void RewireClick(Component button)
-        {
-            PropertyInfo p = button.GetType().GetProperty("onClick", BindingFlags.Public | BindingFlags.Instance);
-            if (p == null) throw new MissingMemberException("UnityEngine.UI.Button.onClick not found");
-            object evt = p.GetValue(button, null);
-            if (evt == null) throw new MissingMemberException("Button.onClick returned null");
-
-            MethodInfo remove = evt.GetType().GetMethod("RemoveAllListeners", Type.EmptyTypes);
-            if (remove != null) remove.Invoke(evt, null);
-
-            MethodInfo add = null;
-            foreach (MethodInfo m in evt.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
-                if (m.Name == "AddListener" && m.GetParameters().Length == 1) { add = m; break; }
-            if (add == null) throw new MissingMethodException("ButtonClickedEvent.AddListener not found");
-
-            Type delegateType = add.GetParameters()[0].ParameterType;
-            MethodInfo handler = typeof(Plugin).GetMethod(nameof(OnRerollClicked), BindingFlags.NonPublic | BindingFlags.Static);
-            Delegate callback = Delegate.CreateDelegate(delegateType, handler);
-            add.Invoke(evt, new object[] { callback });
-        }
-
-        private static void SetButtonLabel(GameObject root, string label)
-        {
-            foreach (Component c in root.GetComponentsInChildren<Component>(true))
-            {
-                if (c == null) continue;
-
-                string typeName = c.GetType().Name ?? "";
-                if (typeName.IndexOf("Localis", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    typeName.IndexOf("Localiz", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    Behaviour b = c as Behaviour;
-                    if (b != null) b.enabled = false;
-                }
-
-                PropertyInfo text = c.GetType().GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
-                if (text != null && text.CanWrite && text.PropertyType == typeof(string))
-                {
-                    try { text.SetValue(c, label, null); } catch { }
+                    foreach (string methodName in methodNames)
+                    {
+                        MethodInfo m = t.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                            null, Type.EmptyTypes, null);
+                        if (m == null) continue;
+                        try
+                        {
+                            m.Invoke(c, null);
+                            Log.LogInfo("Safely refreshed visible shop UI via " + t.Name + "." + m.Name + "().");
+                            return;
+                        }
+                        catch (Exception e)
+                        {
+                            Log.LogWarning("Visible shop UI refresh via " + t.Name + "." + m.Name + " failed: " + Unwrap(e).Message);
+                        }
+                    }
                 }
             }
         }
 
-        private static void OnRerollClicked()
-        {
-            Log.LogInfo("Shop Reroll button clicked.");
-            DoRerollAndRefreshVisibleUi();
-        }
-
-        private static void DoRerollAndRefreshVisibleUi()
-        {
-            try
-            {
-                RefreshShopDatabase();
-                RefreshVisibleShopUi();
-            }
-            catch (Exception e)
-            {
-                Log.LogError("Direct shop reroll failed: " + Unwrap(e));
-            }
-        }
-
-        private static bool RestfulTweaksRefreshPrefix()
-        {
-            DoRerollAndRefreshVisibleUi();
-            return false;
-        }
-
-        private static void RefreshShopDatabase()
-        {
-            Type accessorType = FindType("ShopDatabaseAccessor");
-            if (accessorType == null) throw new MissingMemberException("ShopDatabaseAccessor not found");
-
-            object accessor = FindSingleton(accessorType);
-            MethodInfo getAll = FindMethod(accessorType, "GetAllShops", 0);
-            if (getAll == null) throw new MissingMethodException("GetAllShops not found");
-
-            List<object> shops = Values(getAll.Invoke(getAll.IsStatic ? null : accessor, null));
-            Log.LogInfo("Reroll database: GetAllShops count=" + shops.Count + ".");
-
-            int limited = 0;
-            int refreshed = 0;
-            foreach (object shop in shops)
-            {
-                if (shop == null || !Limited(shop)) continue;
-                limited++;
-
-                MethodInfo create = FindCreate(accessorType, shop.GetType());
-                if (create == null)
-                    throw new MissingMethodException("CreateNewShopList not found for " + shop.GetType().FullName);
-
-                ParameterInfo[] p = create.GetParameters();
-                object[] args = new object[p.Length];
-                args[0] = shop;
-                for (int i = 1; i < p.Length; i++)
-                {
-                    if (p[i].HasDefaultValue) args[i] = p[i].DefaultValue;
-                    else if (p[i].ParameterType == typeof(bool)) args[i] = false;
-                    else if (p[i].ParameterType.IsValueType) args[i] = Activator.CreateInstance(p[i].ParameterType);
-                    else args[i] = null;
-                }
-
-                Log.LogInfo("Calling CreateNewShopList for " + shop.GetType().Name + " via " + create + ".");
-                create.Invoke(create.IsStatic ? null : accessor, args);
-                refreshed++;
-            }
-
-            Log.LogInfo("Reroll database complete: limited=" + limited + ", refreshed=" + refreshed + ".");
-        }
-
-        private static void RefreshVisibleShopUi()
-        {
-            if (ActiveShopUi == null)
-            {
-                Log.LogInfo("No captured live shop UI; database reroll completed without visual refresh.");
-                return;
-            }
-
-            Type t = ActiveShopUi.GetType();
-            string[] names = { "OpenShopUI", "Refresh", "RefreshUI", "UpdateShop", "UpdateUI" };
-            foreach (string name in names)
-            {
-                MethodInfo m = t.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                    null, Type.EmptyTypes, null);
-                if (m == null) continue;
-
-                try
-                {
-                    m.Invoke(ActiveShopUi, null);
-                    Log.LogInfo("Visible shop refreshed through " + t.Name + "." + m.Name + "().");
-                    return;
-                }
-                catch (Exception e)
-                {
-                    Log.LogWarning("Visible refresh through " + m.Name + " failed: " + Unwrap(e).Message);
-                }
-            }
-
-            Log.LogInfo("No known zero-argument refresh method on live " + t.Name + ". Close/reopen the shop to inspect database reroll result.");
-        }
-
-        private static MethodBase FindRestfulTweaksShopRefresh()
+        private static IEnumerable<Assembly> RestfulTweaksAssemblies()
         {
             foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
             {
-                string an = a.GetName().Name ?? "";
-                if (an.IndexOf("RestfulTweaks", StringComparison.OrdinalIgnoreCase) < 0 &&
-                    an.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) < 0)
-                    continue;
+                string n = a.GetName().Name ?? "";
+                if (n.IndexOf("RestfulTweaks", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    n.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) >= 0)
+                    yield return a;
+            }
+        }
 
+        private static MethodBase FindShopRefresh()
+        {
+            foreach (Assembly a in RestfulTweaksAssemblies())
+            {
                 try
                 {
                     foreach (Type t in a.GetTypes())
@@ -513,7 +303,7 @@ namespace TravellersRest.ShopRefreshFix
             return best;
         }
 
-        private static object FindSingleton(Type t)
+        private static object FindInstance(Type t)
         {
             BindingFlags f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
             foreach (PropertyInfo p in t.GetProperties(f))
@@ -544,61 +334,45 @@ namespace TravellersRest.ShopRefreshFix
                 if (x.FieldType == typeof(bool) && x.Name.IndexOf("limited", StringComparison.OrdinalIgnoreCase) >= 0)
                     return (bool)x.GetValue(shop);
 
-            foreach (PropertyInfo p in t.GetProperties(f))
-                if (p.PropertyType == typeof(bool) && p.Name.IndexOf("limited", StringComparison.OrdinalIgnoreCase) >= 0)
-                    return (bool)p.GetValue(shop, null);
+            foreach (PropertyInfo x in t.GetProperties(f))
+                if (x.PropertyType == typeof(bool) && x.GetIndexParameters().Length == 0 &&
+                    x.Name.IndexOf("limited", StringComparison.OrdinalIgnoreCase) >= 0)
+                    try { return (bool)x.GetValue(shop, null); } catch { }
 
             return false;
         }
 
         private static List<object> Values(object source)
         {
-            List<object> result = new List<object>();
-            if (source == null) return result;
+            List<object> r = new List<object>();
+            if (source == null) return r;
 
-            IDictionary dict = source as IDictionary;
-            if (dict != null)
+            if (source is IDictionary d)
             {
-                foreach (object v in dict.Values) if (v != null) result.Add(v);
-                return result;
+                foreach (object v in d.Values) if (v != null) r.Add(v);
+                return r;
             }
 
-            IEnumerable enumerable = source as IEnumerable;
-            if (enumerable != null)
+            if (source is IEnumerable e)
             {
-                foreach (object x in enumerable)
+                foreach (object x in e)
                 {
                     if (x == null) continue;
-                    PropertyInfo value = x.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
-                    if (value != null)
+                    PropertyInfo vp = x.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
+                    if (vp != null)
                     {
                         try
                         {
-                            object v = value.GetValue(x, null);
-                            if (v != null) result.Add(v);
+                            object v = vp.GetValue(x, null);
+                            if (v != null) r.Add(v);
                             continue;
                         }
                         catch { }
                     }
-                    result.Add(x);
+                    r.Add(x);
                 }
             }
-
-            return result;
-        }
-
-        private static string HierarchyPath(Transform t)
-        {
-            if (t == null) return "<null>";
-            string path = t.name;
-            Transform p = t.parent;
-            int guard = 0;
-            while (p != null && guard++ < 32)
-            {
-                path = p.name + "/" + path;
-                p = p.parent;
-            }
-            return path;
+            return r;
         }
 
         private static Exception Unwrap(Exception e)
