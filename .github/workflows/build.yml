@@ -11,20 +11,37 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
+      - name: Download BepInEx reference DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/BepInEx/BepInEx/releases/download/v5.4.23.5/BepInEx_win_x64_5.4.23.5.zip'
+          Invoke-WebRequest -Uri $url -OutFile 'bepinex.zip'
+          Expand-Archive -Path 'bepinex.zip' -DestinationPath 'bepinex' -Force
+          New-Item -ItemType Directory -Force 'libs' | Out-Null
+          Copy-Item 'bepinex/BepInEx/core/BepInEx.dll' 'libs/BepInEx.dll'
+          Copy-Item 'bepinex/BepInEx/core/0Harmony.dll' 'libs/0Harmony.dll'
+          Get-ChildItem 'libs'
+
       - name: Build
         run: dotnet build RestfulTweaksShopRefreshFix.csproj --configuration Release
+
       - name: Collect DLL
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifact | Out-Null
-          Copy-Item "bin/Release/net48/RestfulTweaksShopRefreshFix.dll" "artifact/RestfulTweaksShopRefreshFix.dll"
+          Copy-Item 'bin/Release/net48/RestfulTweaksShopRefreshFix.dll' 'artifact/RestfulTweaksShopRefreshFix.dll'
+
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
