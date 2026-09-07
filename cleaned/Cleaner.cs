@@ -65,13 +65,13 @@ internal static class Cleaner
         if (info != null)
         {
             var version = info.Fields.FirstOrDefault(f => f.Name == "PLUGIN_VERSION" && f.HasConstant && f.Constant is string);
-            if (version != null) version.Constant = "1.7.1-clean";
+            if (version != null) version.Constant = "1.7.1";
         }
 
         foreach (var ca in plugin.CustomAttributes)
         {
             if (ca.AttributeType.FullName == "BepInEx.BepInPlugin" && ca.ConstructorArguments.Count >= 3)
-                ca.ConstructorArguments[2] = new CustomAttributeArgument(module.TypeSystem.String, "1.7.1-clean");
+                ca.ConstructorArguments[2] = new CustomAttributeArgument(module.TypeSystem.String, "1.7.1");
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
