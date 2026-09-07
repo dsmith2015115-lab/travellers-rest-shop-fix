@@ -9,271 +9,306 @@ using UnityEngine;
 
 namespace TravellersRest.ShopRefreshFix
 {
-    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Refresh Fix", "1.6.0")]
+    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Compatibility", "2.0.0")]
     [BepInDependency("net.nep.bepinex.restfultweaks", BepInDependency.DependencyFlags.HardDependency)]
     public sealed class Plugin : BaseUnityPlugin
     {
         private const string HarmonyId = "dsmith.travellersrest.restfultweaks.shoprefreshfix";
-        private static readonly string[] ShopUiTypeNames = { "ShopBaseUI", "ShopUI", "FerroShopUI", "AnimalShopUI" };
-        private static readonly Dictionary<int, GameObject> Buttons = new Dictionary<int, GameObject>();
-        private static readonly HashSet<MethodBase> PatchedUiUpdates = new HashSet<MethodBase>();
         private static ManualLogSource Log;
+        private static Type RestfulPluginType;
+        private static readonly Dictionary<object, ShopSnapshot> ShopSnapshots = new Dictionary<object, ShopSnapshot>(ReferenceComparer.Instance);
+        private static readonly Dictionary<object, ItemSnapshot> ItemSnapshots = new Dictionary<object, ItemSnapshot>(ReferenceComparer.Instance);
+
+        private float nextConfigCheck;
+        private static bool lastDaily;
+        private static bool lastAllItems;
+        private static bool lastUnlimited;
+        private static bool configInitialized;
 
         private void Awake()
         {
             Log = Logger;
+
             try
             {
                 Harmony harmony = new Harmony(HarmonyId);
+                RestfulPluginType = FindRestfulPluginType();
 
-                MethodBase oldRefresh = FindShopRefresh();
+                MethodBase oldRefresh = FindRestfulShopRefresh();
                 if (oldRefresh != null)
                 {
                     harmony.Patch(oldRefresh,
-                        prefix: new HarmonyMethod(typeof(Plugin).GetMethod(nameof(RestfulTweaksRefreshPrefix), BindingFlags.NonPublic | BindingFlags.Static)));
-                    Log.LogInfo("v1.6.0 patched Restful Tweaks " + oldRefresh.DeclaringType.FullName + "." + oldRefresh.Name + ".");
+                        prefix: new HarmonyMethod(typeof(Plugin).GetMethod(nameof(ShopRefreshPrefix), BindingFlags.NonPublic | BindingFlags.Static)));
+                    Log.LogInfo("Replaced deprecated Restful Tweaks ShopRefresh backend.");
+                }
+                else
+                {
+                    Log.LogWarning("Restful Tweaks ShopRefresh() was not found; config compatibility remains active.");
                 }
 
-                InstallShopUiUpdateHooks(harmony);
-                Log.LogInfo("v1.6.0 safe all-shop mode active. No vendor OpenShopUI hooks are used.");
+                Type accessorType = FindType("ShopDatabaseAccessor");
+                MethodInfo awake = accessorType != null ? FindZeroArgMethod(accessorType, "Awake") : null;
+                if (awake != null)
+                {
+                    harmony.Patch(awake,
+                        postfix: new HarmonyMethod(typeof(Plugin).GetMethod(nameof(ShopDatabaseAwakePostfix), BindingFlags.NonPublic | BindingFlags.Static)));
+                    Log.LogInfo("Hooked current ShopDatabaseAccessor.Awake().");
+                }
+                else
+                {
+                    Log.LogWarning("Current ShopDatabaseAccessor.Awake() was not found.");
+                }
+
+                ReadAndApplyConfig(false);
+                Log.LogInfo("Shop compatibility v2.0.0 active: Update Stock Daily / All Items / Unlimited Items / Refresh Shops hotkey use the current shop API. No UI polling or vendor lifecycle hooks are used.");
             }
             catch (Exception e)
             {
-                Log.LogError("Startup failed: " + e);
+                Log.LogError("Shop compatibility startup failed: " + Unwrap(e));
             }
         }
 
-        private static void InstallShopUiUpdateHooks(Harmony harmony)
+        private void Update()
         {
-            int patched = 0;
-            MethodInfo postfix = typeof(Plugin).GetMethod(nameof(ShopUiUpdatePostfix), BindingFlags.NonPublic | BindingFlags.Static);
+            if (Time.unscaledTime < nextConfigCheck)
+                return;
 
-            foreach (string typeName in ShopUiTypeNames)
+            nextConfigCheck = Time.unscaledTime + 0.75f;
+
+            try
             {
-                Type t = FindType(typeName);
-                if (t == null)
-                {
-                    Log.LogWarning("Shop UI type not found: " + typeName);
-                    continue;
-                }
-
-                MethodInfo update = AccessTools.Method(t, "Update", Type.EmptyTypes);
-                if (update == null)
-                {
-                    Log.LogInfo("No Update() method found on " + t.FullName + ".");
-                    continue;
-                }
-
-                if (!PatchedUiUpdates.Add(update))
-                    continue;
-
-                harmony.Patch(update, postfix: new HarmonyMethod(postfix));
-                patched++;
-                Log.LogInfo("Hooked shop UI update: " + update.DeclaringType.FullName + ".Update().");
+                ReadAndApplyConfig(true);
             }
-
-            Log.LogInfo("All-shop UI hooks installed=" + patched + ".");
+            catch (Exception e)
+            {
+                Log.LogWarning("Shop config check failed: " + Unwrap(e).Message);
+            }
         }
 
-        private static void ShopUiUpdatePostfix(object __instance)
+        private static void ShopDatabaseAwakePostfix()
         {
             try
             {
-                Component ui = __instance as Component;
-                if (ui == null || ui.gameObject == null || !ui.gameObject.activeInHierarchy)
-                    return;
-
-                EnsureButton(ui);
+                ReadAndApplyConfig(false);
             }
             catch (Exception e)
             {
-                Log.LogWarning("Shop button injection failed: " + Unwrap(e).Message);
+                Log.LogError("Applying shop settings after database initialization failed: " + Unwrap(e));
             }
         }
 
-        private static void EnsureButton(Component shopUi)
-        {
-            int id = shopUi.GetInstanceID();
-            GameObject existing;
-            if (Buttons.TryGetValue(id, out existing) && existing != null)
-                return;
-
-            GameObject alreadyThere = FindNamedChild(shopUi.gameObject, "ShopRerollButton");
-            if (alreadyThere != null)
-            {
-                Buttons[id] = alreadyThere;
-                return;
-            }
-
-            Component wrapper = FindVersatileButton(shopUi.gameObject);
-            GameObject sourceRoot = wrapper != null ? wrapper.gameObject : null;
-            Component sourceButton = sourceRoot != null ? FindUnityButton(sourceRoot) : null;
-
-            if (sourceButton == null)
-            {
-                sourceButton = FindUnityButton(shopUi.gameObject);
-                sourceRoot = sourceButton != null ? sourceButton.gameObject : null;
-            }
-
-            if (sourceRoot == null || sourceButton == null)
-                return;
-
-            Transform parent = sourceRoot.transform.parent;
-            if (parent == null)
-                return;
-
-            GameObject clone = UnityEngine.Object.Instantiate(sourceRoot, parent);
-            clone.name = "ShopRerollButton";
-
-            PositionClone(sourceRoot, clone);
-            SetButtonLabel(clone, "Reroll");
-
-            Component clonedButton = FindUnityButton(clone);
-            if (clonedButton == null)
-            {
-                UnityEngine.Object.Destroy(clone);
-                return;
-            }
-
-            RerollClickProxy proxy = clone.AddComponent<RerollClickProxy>();
-            proxy.ShopUi = shopUi;
-            RewireClick(clonedButton, proxy);
-
-            clone.SetActive(true);
-            Buttons[id] = clone;
-            Log.LogInfo("Created Reroll button for " + shopUi.GetType().Name + " at " + HierarchyPath(clone.transform) + ".");
-        }
-
-        private static void PositionClone(GameObject source, GameObject clone)
-        {
-            Transform parent = source.transform.parent;
-            bool hasLayout = false;
-            foreach (Component c in parent.GetComponents<Component>())
-            {
-                if (c == null) continue;
-                string n = c.GetType().Name;
-                if (n.IndexOf("LayoutGroup", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    hasLayout = true;
-                    break;
-                }
-            }
-
-            if (hasLayout)
-            {
-                clone.transform.SetSiblingIndex(source.transform.GetSiblingIndex() + 1);
-                return;
-            }
-
-            RectTransform src = source.GetComponent<RectTransform>();
-            RectTransform dst = clone.GetComponent<RectTransform>();
-            if (src != null && dst != null)
-            {
-                float w = src.rect.width;
-                if (w < 1f) w = 120f;
-                dst.anchoredPosition = src.anchoredPosition + new Vector2(w + 12f, 0f);
-            }
-            else
-            {
-                clone.transform.localPosition += new Vector3(140f, 0f, 0f);
-            }
-        }
-
-        internal static void OnRerollClicked(Component shopUi)
+        private static bool ShopRefreshPrefix()
         {
             try
             {
-                Log.LogInfo("Reroll clicked in " + (shopUi != null ? shopUi.GetType().Name : "unknown shop UI") + ".");
-
-                bool single = RefreshCurrentShop(shopUi);
-                if (!single)
-                {
-                    Log.LogWarning("Could not map this UI to one shop record; falling back to refreshing all limited shops.");
-                    RefreshAllLimitedShops();
-                }
-
-                TrySafeVisibleRefresh(shopUi);
+                ApplySettingsToAllShops();
+                RefreshAllLimitedShops();
             }
             catch (Exception e)
             {
-                Log.LogError("Shop Reroll click failed: " + Unwrap(e));
+                Log.LogError("Modern shop refresh failed: " + Unwrap(e));
             }
-        }
 
-        private static bool RestfulTweaksRefreshPrefix()
-        {
-            try { RefreshAllLimitedShops(); }
-            catch (Exception e) { Log.LogError("Restful Tweaks ShopRefresh redirect failed: " + Unwrap(e)); }
             return false;
         }
 
-        private static bool RefreshCurrentShop(Component shopUi)
+        private static void ReadAndApplyConfig(bool refreshOnChange)
         {
-            if (shopUi == null)
+            if (RestfulPluginType == null)
+                RestfulPluginType = FindRestfulPluginType();
+            if (RestfulPluginType == null)
+                return;
+
+            bool daily = ReadConfigBool("_shopUpdateDaily");
+            bool allItems = ReadConfigBool("_shopAllItems");
+            bool unlimited = ReadConfigBool("_shopMoreItems");
+
+            bool changed = !configInitialized || daily != lastDaily || allItems != lastAllItems || unlimited != lastUnlimited;
+            if (!changed)
+                return;
+
+            bool first = !configInitialized;
+            configInitialized = true;
+            lastDaily = daily;
+            lastAllItems = allItems;
+            lastUnlimited = unlimited;
+
+            ApplySettingsToAllShops();
+
+            Log.LogInfo("Restful Tweaks shop settings applied: Update Stock Daily=" + daily +
+                        ", All Items=" + allItems + ", Unlimited Items=" + unlimited + ".");
+
+            if (refreshOnChange && !first)
+            {
+                RefreshAllLimitedShops();
+                Log.LogInfo("Shop setting changed; regenerated limited shop inventories.");
+            }
+        }
+
+        private static bool ReadConfigBool(string fieldName)
+        {
+            FieldInfo field = RestfulPluginType.GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
+            if (field == null)
                 return false;
 
-            Type accessorType = FindType("ShopDatabaseAccessor");
-            if (accessorType == null)
+            object entry = field.GetValue(null);
+            if (entry == null)
                 return false;
 
-            object accessor = FindInstance(accessorType);
-            MethodInfo getAll = FindMethod(accessorType, "GetAllShops", 0);
-            if (getAll == null)
-                return false;
+            PropertyInfo value = entry.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
+            if (value != null && value.PropertyType == typeof(bool))
+                return (bool)value.GetValue(entry, null);
 
-            List<object> shops = Values(getAll.Invoke(getAll.IsStatic ? null : accessor, null));
-            object current = FindShopRecordReferencedByUi(shopUi, shops);
+            PropertyInfo boxed = entry.GetType().GetProperty("BoxedValue", BindingFlags.Public | BindingFlags.Instance);
+            if (boxed != null)
+            {
+                object v = boxed.GetValue(entry, null);
+                if (v is bool)
+                    return (bool)v;
+            }
+
+            return false;
+        }
+
+        private static void ApplySettingsToAllShops()
+        {
+            List<object> shops = GetAllShops();
+            if (shops == null)
+                return;
+
+            int changedShops = 0;
+            int changedItems = 0;
+
+            foreach (object shop in shops)
+            {
+                if (shop == null)
+                    continue;
+
+                CaptureShopSnapshot(shop);
+                bool shopChanged = ApplyDailySetting(shop, lastDaily);
+
+                object shopItems = GetMemberValue(shop, "shopItems");
+                if (shopItems is IEnumerable enumerable)
+                {
+                    foreach (object item in enumerable)
+                    {
+                        if (item == null)
+                            continue;
+
+                        CaptureItemSnapshot(item);
+                        bool itemChanged = false;
+                        itemChanged |= SetBoolMember(item, "alwaysAppear", lastAllItems ? true : ItemSnapshots[item].AlwaysAppear);
+                        itemChanged |= SetBoolMember(item, "unlimited", lastUnlimited ? true : ItemSnapshots[item].Unlimited);
+                        if (itemChanged)
+                            changedItems++;
+                    }
+                }
+
+                if (shopChanged)
+                    changedShops++;
+            }
+
+            Log.LogInfo("Applied current shop settings to " + shops.Count + " shop record(s); changed shop records=" + changedShops + ", changed item records=" + changedItems + ".");
+        }
+
+        private static bool ApplyDailySetting(object shop, bool enabled)
+        {
+            ShopSnapshot snapshot = ShopSnapshots[shop];
+            object current = GetMemberValue(shop, "updateDays");
             if (current == null)
                 return false;
 
-            MethodInfo create = FindCreate(accessorType, current.GetType());
-            if (create == null)
-                return false;
+            Type listType = current.GetType();
+            object replacement;
 
-            InvokeCreate(create, accessor, current);
-            Log.LogInfo("Rerolled current shop record: " + DescribeShop(current) + ".");
-            return true;
-        }
-
-        private static object FindShopRecordReferencedByUi(Component ui, List<object> shops)
-        {
-            if (shops == null || shops.Count == 0)
-                return null;
-
-            HashSet<object> set = new HashSet<object>(shops, ReferenceEqualityComparer.Instance);
-            Type t = ui.GetType();
-
-            while (t != null && t != typeof(MonoBehaviour) && t != typeof(Component))
+            if (enabled)
             {
-                BindingFlags f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
-
-                foreach (FieldInfo field in t.GetFields(f))
-                {
-                    try
-                    {
-                        object value = field.GetValue(ui);
-                        if (value != null && set.Contains(value))
-                            return value;
-                    }
-                    catch { }
-                }
-
-                foreach (PropertyInfo prop in t.GetProperties(f))
-                {
-                    if (!prop.CanRead || prop.GetIndexParameters().Length != 0) continue;
-                    try
-                    {
-                        object value = prop.GetValue(ui, null);
-                        if (value != null && set.Contains(value))
-                            return value;
-                    }
-                    catch { }
-                }
-
-                t = t.BaseType;
+                replacement = CreateEveryDayList(listType);
+                if (replacement == null)
+                    return false;
+            }
+            else
+            {
+                replacement = CloneList(snapshot.UpdateDays);
+                if (replacement == null)
+                    replacement = snapshot.UpdateDays;
             }
 
-            return null;
+            return SetMemberValue(shop, "updateDays", replacement);
+        }
+
+        private static object CreateEveryDayList(Type listType)
+        {
+            try
+            {
+                object list = Activator.CreateInstance(listType);
+                IList ilist = list as IList;
+                if (ilist == null)
+                    return null;
+
+                Type[] args = listType.IsGenericType ? listType.GetGenericArguments() : Type.EmptyTypes;
+                if (args.Length != 1 || !args[0].IsEnum)
+                    return null;
+
+                Type dayType = args[0];
+                string[] days = { "Mon", "Tue", "Wed", "Thurs", "Fri", "Sat", "Sun" };
+                foreach (string day in days)
+                {
+                    try { ilist.Add(Enum.Parse(dayType, day, true)); }
+                    catch { }
+                }
+
+                return list;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void CaptureShopSnapshot(object shop)
+        {
+            if (ShopSnapshots.ContainsKey(shop))
+                return;
+
+            ShopSnapshots[shop] = new ShopSnapshot
+            {
+                UpdateDays = CloneList(GetMemberValue(shop, "updateDays"))
+            };
+        }
+
+        private static void CaptureItemSnapshot(object item)
+        {
+            if (ItemSnapshots.ContainsKey(item))
+                return;
+
+            ItemSnapshots[item] = new ItemSnapshot
+            {
+                AlwaysAppear = ReadBoolMember(item, "alwaysAppear"),
+                Unlimited = ReadBoolMember(item, "unlimited")
+            };
+        }
+
+        private static object CloneList(object source)
+        {
+            if (!(source is IEnumerable enumerable))
+                return source;
+
+            try
+            {
+                object clone = Activator.CreateInstance(source.GetType());
+                IList list = clone as IList;
+                if (list == null)
+                    return source;
+
+                foreach (object value in enumerable)
+                    list.Add(value);
+                return clone;
+            }
+            catch
+            {
+                return source;
+            }
         }
 
         private static void RefreshAllLimitedShops()
@@ -283,185 +318,259 @@ namespace TravellersRest.ShopRefreshFix
                 throw new MissingMemberException("ShopDatabaseAccessor not found");
 
             object accessor = FindInstance(accessorType);
-            MethodInfo getAll = FindMethod(accessorType, "GetAllShops", 0);
-            if (getAll == null)
-                throw new MissingMethodException("ShopDatabaseAccessor.GetAllShops() not found");
-
-            List<object> shops = Values(getAll.Invoke(getAll.IsStatic ? null : accessor, null));
+            List<object> shops = GetAllShops();
             int limited = 0;
             int refreshed = 0;
 
             foreach (object shop in shops)
             {
-                if (shop == null || !Limited(shop))
+                if (shop == null || !ReadBoolMember(shop, "limitedItems"))
                     continue;
 
                 limited++;
-                MethodInfo create = FindCreate(accessorType, shop.GetType());
+                MethodInfo create = FindCreateNewShopList(accessorType, shop.GetType());
                 if (create == null)
+                {
+                    Log.LogWarning("No compatible CreateNewShopList overload for " + shop.GetType().FullName + ".");
                     continue;
+                }
 
-                InvokeCreate(create, accessor, shop);
+                object[] args = BuildArguments(create, shop);
+                create.Invoke(create.IsStatic ? null : accessor, args);
                 refreshed++;
             }
 
-            Log.LogInfo("Shop reroll complete: refreshed " + refreshed + "/" + limited + " limited shop(s).");
+            Log.LogInfo("Modern shop refresh complete: refreshed " + refreshed + "/" + limited + " limited shop(s).");
         }
 
-        private static void InvokeCreate(MethodInfo create, object accessor, object shop)
+        private static List<object> GetAllShops()
         {
-            ParameterInfo[] p = create.GetParameters();
-            object[] args = new object[p.Length];
+            Type accessorType = FindType("ShopDatabaseAccessor");
+            if (accessorType == null)
+                return new List<object>();
+
+            object accessor = FindInstance(accessorType);
+            MethodInfo getAll = FindZeroArgMethod(accessorType, "GetAllShops");
+            if (getAll == null)
+                return new List<object>();
+
+            object result = getAll.Invoke(getAll.IsStatic ? null : accessor, null);
+            return Values(result);
+        }
+
+        private static MethodInfo FindCreateNewShopList(Type accessorType, Type shopType)
+        {
+            MethodInfo best = null;
+            foreach (MethodInfo method in accessorType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+            {
+                if (method.Name != "CreateNewShopList")
+                    continue;
+
+                ParameterInfo[] parameters = method.GetParameters();
+                if (parameters.Length == 0)
+                    continue;
+
+                Type first = parameters[0].ParameterType;
+                if (!first.IsAssignableFrom(shopType) && !shopType.IsAssignableFrom(first))
+                    continue;
+
+                if (best == null || parameters.Length < best.GetParameters().Length)
+                    best = method;
+            }
+            return best;
+        }
+
+        private static object[] BuildArguments(MethodInfo method, object shop)
+        {
+            ParameterInfo[] parameters = method.GetParameters();
+            object[] args = new object[parameters.Length];
             args[0] = shop;
 
-            for (int i = 1; i < p.Length; i++)
+            for (int i = 1; i < parameters.Length; i++)
             {
-                if (p[i].HasDefaultValue) args[i] = p[i].DefaultValue;
-                else if (p[i].ParameterType == typeof(bool)) args[i] = false;
-                else if (p[i].ParameterType.IsValueType) args[i] = Activator.CreateInstance(p[i].ParameterType);
+                ParameterInfo p = parameters[i];
+                if (p.HasDefaultValue) args[i] = p.DefaultValue;
+                else if (p.ParameterType == typeof(bool)) args[i] = false;
+                else if (p.ParameterType.IsValueType) args[i] = Activator.CreateInstance(p.ParameterType);
                 else args[i] = null;
             }
-
-            create.Invoke(create.IsStatic ? null : accessor, args);
+            return args;
         }
 
-        private static void TrySafeVisibleRefresh(Component ui)
+        private static object FindInstance(Type type)
         {
-            if (ui == null)
-                return;
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
 
-            string[] methodNames = { "Refresh", "RefreshUI", "UpdateUI", "UpdateShop" };
-            Type t = ui.GetType();
-
-            foreach (string name in methodNames)
+            foreach (PropertyInfo p in type.GetProperties(flags))
             {
-                MethodInfo m = t.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                    null, Type.EmptyTypes, null);
-                if (m == null) continue;
-
+                if (p.GetIndexParameters().Length != 0 || !type.IsAssignableFrom(p.PropertyType))
+                    continue;
                 try
                 {
-                    m.Invoke(ui, null);
-                    Log.LogInfo("Refreshed visible shop UI via " + t.Name + "." + name + "().");
-                    return;
+                    object value = p.GetValue(null, null);
+                    if (value != null) return value;
                 }
-                catch (Exception e)
-                {
-                    Log.LogWarning("Visible shop refresh " + t.Name + "." + name + " failed: " + Unwrap(e).Message);
-                }
+                catch { }
             }
 
-            Log.LogInfo("No safe explicit refresh method found on " + t.Name + "; the rerolled stock may appear after closing and reopening the shop.");
-        }
-
-        private static Component FindVersatileButton(GameObject root)
-        {
-            foreach (Component c in root.GetComponentsInChildren<Component>(true))
+            foreach (FieldInfo f in type.GetFields(flags))
             {
-                if (c == null || c.gameObject.name == "ShopRerollButton") continue;
-                if (string.Equals(c.GetType().Name, "VersatileButton", StringComparison.Ordinal))
-                    return c;
+                if (!type.IsAssignableFrom(f.FieldType))
+                    continue;
+                try
+                {
+                    object value = f.GetValue(null);
+                    if (value != null) return value;
+                }
+                catch { }
             }
+
+            foreach (MethodInfo m in type.GetMethods(flags))
+            {
+                if (m.GetParameters().Length != 0 || !type.IsAssignableFrom(m.ReturnType))
+                    continue;
+                try
+                {
+                    object value = m.Invoke(null, null);
+                    if (value != null) return value;
+                }
+                catch { }
+            }
+
             return null;
         }
 
-        private static Component FindUnityButton(GameObject root)
+        private static object GetMemberValue(object instance, string name)
         {
-            foreach (Component c in root.GetComponentsInChildren<Component>(true))
-                if (c != null && c.GetType().FullName == "UnityEngine.UI.Button")
-                    return c;
+            if (instance == null) return null;
+            Type t = instance.GetType();
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+            FieldInfo field = t.GetField(name, flags);
+            if (field != null)
+            {
+                try { return field.GetValue(instance); } catch { }
+            }
+
+            PropertyInfo prop = t.GetProperty(name, flags);
+            if (prop != null && prop.CanRead && prop.GetIndexParameters().Length == 0)
+            {
+                try { return prop.GetValue(instance, null); } catch { }
+            }
+
             return null;
         }
 
-        private static GameObject FindNamedChild(GameObject root, string name)
+        private static bool SetMemberValue(object instance, string name, object value)
         {
-            Transform[] transforms = root.GetComponentsInChildren<Transform>(true);
-            foreach (Transform t in transforms)
-                if (t != null && t.gameObject.name == name)
-                    return t.gameObject;
+            Type t = instance.GetType();
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+            FieldInfo field = t.GetField(name, flags);
+            if (field != null)
+            {
+                try
+                {
+                    object current = field.GetValue(instance);
+                    if (ReferenceEquals(current, value)) return false;
+                    field.SetValue(instance, value);
+                    return true;
+                }
+                catch { }
+            }
+
+            PropertyInfo prop = t.GetProperty(name, flags);
+            if (prop != null && prop.CanWrite)
+            {
+                try
+                {
+                    object current = prop.CanRead ? prop.GetValue(instance, null) : null;
+                    if (ReferenceEquals(current, value)) return false;
+                    prop.SetValue(instance, value, null);
+                    return true;
+                }
+                catch { }
+            }
+            return false;
+        }
+
+        private static bool ReadBoolMember(object instance, string name)
+        {
+            object value = GetMemberValue(instance, name);
+            return value is bool && (bool)value;
+        }
+
+        private static bool SetBoolMember(object instance, string name, bool value)
+        {
+            Type t = instance.GetType();
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+            FieldInfo field = t.GetField(name, flags);
+            if (field != null && field.FieldType == typeof(bool))
+            {
+                try
+                {
+                    bool current = (bool)field.GetValue(instance);
+                    if (current == value) return false;
+                    field.SetValue(instance, value);
+                    return true;
+                }
+                catch { }
+            }
+
+            PropertyInfo prop = t.GetProperty(name, flags);
+            if (prop != null && prop.PropertyType == typeof(bool) && prop.CanWrite)
+            {
+                try
+                {
+                    bool current = prop.CanRead && (bool)prop.GetValue(instance, null);
+                    if (current == value) return false;
+                    prop.SetValue(instance, value, null);
+                    return true;
+                }
+                catch { }
+            }
+            return false;
+        }
+
+        private static MethodInfo FindZeroArgMethod(Type type, string name)
+        {
+            foreach (MethodInfo method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+                if (method.Name == name && method.GetParameters().Length == 0)
+                    return method;
             return null;
         }
 
-        private static void RewireClick(Component button, RerollClickProxy proxy)
-        {
-            PropertyInfo p = button.GetType().GetProperty("onClick", BindingFlags.Public | BindingFlags.Instance);
-            if (p == null)
-                throw new MissingMemberException("UnityEngine.UI.Button.onClick not found");
-
-            object evt = p.GetValue(button, null);
-            if (evt == null)
-                throw new MissingMemberException("Button.onClick returned null");
-
-            MethodInfo remove = evt.GetType().GetMethod("RemoveAllListeners", Type.EmptyTypes);
-            if (remove != null)
-                remove.Invoke(evt, null);
-
-            MethodInfo add = null;
-            foreach (MethodInfo m in evt.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
-            {
-                if (m.Name == "AddListener" && m.GetParameters().Length == 1)
-                {
-                    add = m;
-                    break;
-                }
-            }
-
-            if (add == null)
-                throw new MissingMethodException("ButtonClickedEvent.AddListener not found");
-
-            Type delegateType = add.GetParameters()[0].ParameterType;
-            MethodInfo handler = typeof(RerollClickProxy).GetMethod(nameof(RerollClickProxy.InvokeReroll), BindingFlags.Public | BindingFlags.Instance);
-            Delegate callback = Delegate.CreateDelegate(delegateType, proxy, handler);
-            add.Invoke(evt, new object[] { callback });
-        }
-
-        private static void SetButtonLabel(GameObject button, string label)
-        {
-            foreach (Component c in button.GetComponentsInChildren<Component>(true))
-            {
-                if (c == null) continue;
-
-                string typeName = c.GetType().Name ?? "";
-                if (typeName.IndexOf("Localis", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    typeName.IndexOf("Localiz", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    Behaviour b = c as Behaviour;
-                    if (b != null) b.enabled = false;
-                }
-
-                PropertyInfo text = c.GetType().GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
-                if (text != null && text.CanWrite && text.PropertyType == typeof(string))
-                {
-                    try { text.SetValue(c, label, null); } catch { }
-                }
-            }
-        }
-
-        private static IEnumerable<Assembly> RestfulTweaksAssemblies()
+        private static Type FindRestfulPluginType()
         {
             foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
             {
                 string n = a.GetName().Name ?? "";
-                if (n.IndexOf("RestfulTweaks", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) >= 0)
-                    yield return a;
-            }
-        }
+                if (n.IndexOf("RestfulTweaks", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    n.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
 
-        private static MethodBase FindShopRefresh()
-        {
-            foreach (Assembly a in RestfulTweaksAssemblies())
-            {
                 try
                 {
-                    foreach (Type t in a.GetTypes())
-                    foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
-                        if (m.ReturnType == typeof(void) && m.GetParameters().Length == 0 &&
-                            m.Name.IndexOf("ShopRefresh", StringComparison.OrdinalIgnoreCase) >= 0)
-                            return m;
+                    Type t = a.GetType("RestfulTweaks.Plugin", false);
+                    if (t != null) return t;
+                    foreach (Type candidate in a.GetTypes())
+                        if (candidate.Name == "Plugin" && candidate.Namespace == "RestfulTweaks")
+                            return candidate;
                 }
                 catch { }
             }
+            return null;
+        }
+
+        private static MethodBase FindRestfulShopRefresh()
+        {
+            Type t = RestfulPluginType ?? FindRestfulPluginType();
+            if (t == null) return null;
+
+            foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+                if (m.Name == "ShopRefresh" && m.ReturnType == typeof(void) && m.GetParameters().Length == 0)
+                    return m;
             return null;
         }
 
@@ -481,118 +590,38 @@ namespace TravellersRest.ShopRefreshFix
             return null;
         }
 
-        private static MethodInfo FindMethod(Type t, string name, int count)
-        {
-            foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
-                if (m.Name == name && m.GetParameters().Length == count)
-                    return m;
-            return null;
-        }
-
-        private static MethodInfo FindCreate(Type t, Type shopType)
-        {
-            MethodInfo best = null;
-            foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
-            {
-                if (m.Name != "CreateNewShopList") continue;
-                ParameterInfo[] p = m.GetParameters();
-                if (p.Length == 0 || !p[0].ParameterType.IsAssignableFrom(shopType)) continue;
-                if (best == null || p.Length < best.GetParameters().Length) best = m;
-            }
-            return best;
-        }
-
-        private static object FindInstance(Type t)
-        {
-            BindingFlags f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
-            foreach (PropertyInfo p in t.GetProperties(f))
-            {
-                if (!t.IsAssignableFrom(p.PropertyType) || p.GetIndexParameters().Length != 0) continue;
-                try { object v = p.GetValue(null, null); if (v != null) return v; } catch { }
-            }
-            foreach (FieldInfo x in t.GetFields(f))
-            {
-                if (!t.IsAssignableFrom(x.FieldType)) continue;
-                try { object v = x.GetValue(null); if (v != null) return v; } catch { }
-            }
-            return null;
-        }
-
-        private static bool Limited(object shop)
-        {
-            BindingFlags f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-            Type t = shop.GetType();
-
-            FieldInfo field = t.GetField("limitedItems", f);
-            if (field != null && field.FieldType == typeof(bool)) return (bool)field.GetValue(shop);
-
-            PropertyInfo prop = t.GetProperty("limitedItems", f);
-            if (prop != null && prop.PropertyType == typeof(bool)) return (bool)prop.GetValue(shop, null);
-
-            foreach (FieldInfo x in t.GetFields(f))
-                if (x.FieldType == typeof(bool) && x.Name.IndexOf("limited", StringComparison.OrdinalIgnoreCase) >= 0)
-                    return (bool)x.GetValue(shop);
-
-            foreach (PropertyInfo x in t.GetProperties(f))
-                if (x.PropertyType == typeof(bool) && x.GetIndexParameters().Length == 0 &&
-                    x.Name.IndexOf("limited", StringComparison.OrdinalIgnoreCase) >= 0)
-                    try { return (bool)x.GetValue(shop, null); } catch { }
-
-            return false;
-        }
-
         private static List<object> Values(object source)
         {
-            List<object> r = new List<object>();
-            if (source == null) return r;
+            List<object> result = new List<object>();
+            if (source == null) return result;
 
-            IDictionary d = source as IDictionary;
-            if (d != null)
+            if (source is IDictionary dictionary)
             {
-                foreach (object v in d.Values) if (v != null) r.Add(v);
-                return r;
+                foreach (object value in dictionary.Values)
+                    if (value != null) result.Add(value);
+                return result;
             }
 
-            IEnumerable e = source as IEnumerable;
-            if (e != null)
+            if (source is IEnumerable enumerable)
             {
-                foreach (object x in e)
+                foreach (object item in enumerable)
                 {
-                    if (x == null) continue;
-                    PropertyInfo vp = x.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
-                    if (vp != null)
+                    if (item == null) continue;
+                    PropertyInfo valueProp = item.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
+                    if (valueProp != null)
                     {
                         try
                         {
-                            object v = vp.GetValue(x, null);
-                            if (v != null) r.Add(v);
+                            object value = valueProp.GetValue(item, null);
+                            if (value != null) result.Add(value);
                             continue;
                         }
                         catch { }
                     }
-                    r.Add(x);
+                    result.Add(item);
                 }
             }
-            return r;
-        }
-
-        private static string DescribeShop(object shop)
-        {
-            if (shop == null) return "null";
-            return shop.GetType().FullName ?? shop.GetType().Name;
-        }
-
-        private static string HierarchyPath(Transform t)
-        {
-            if (t == null) return "<null>";
-            List<string> names = new List<string>();
-            while (t != null)
-            {
-                names.Add(t.gameObject.name);
-                t = t.parent;
-            }
-            names.Reverse();
-            return string.Join("/", names.ToArray());
+            return result;
         }
 
         private static Exception Unwrap(Exception e)
@@ -601,22 +630,23 @@ namespace TravellersRest.ShopRefreshFix
                 e = e.InnerException;
             return e;
         }
-    }
 
-    public sealed class RerollClickProxy : MonoBehaviour
-    {
-        public Component ShopUi;
-
-        public void InvokeReroll()
+        private sealed class ShopSnapshot
         {
-            Plugin.OnRerollClicked(ShopUi);
+            public object UpdateDays;
         }
-    }
 
-    internal sealed class ReferenceEqualityComparer : IEqualityComparer<object>
-    {
-        internal static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
-        public new bool Equals(object x, object y) { return ReferenceEquals(x, y); }
-        public int GetHashCode(object obj) { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj); }
+        private sealed class ItemSnapshot
+        {
+            public bool AlwaysAppear;
+            public bool Unlimited;
+        }
+
+        private sealed class ReferenceComparer : IEqualityComparer<object>
+        {
+            internal static readonly ReferenceComparer Instance = new ReferenceComparer();
+            public new bool Equals(object x, object y) { return ReferenceEquals(x, y); }
+            public int GetHashCode(object obj) { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj); }
+        }
     }
 }
