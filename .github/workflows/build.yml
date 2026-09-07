@@ -1,0 +1,41 @@
+name: Build Shop Refresh Fix
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore RestfulTweaksShopRefreshFix.csproj
+
+      - name: Build
+        run: dotnet build RestfulTweaksShopRefreshFix.csproj --configuration Release --no-restore
+
+      - name: Collect DLL
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item "bin/Release/netstandard2.0/RestfulTweaksShopRefreshFix.dll" "artifact/RestfulTweaksShopRefreshFix.dll"
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: RestfulTweaksShopRefreshFix
+          path: artifact/RestfulTweaksShopRefreshFix.dll
+          if-no-files-found: error
