@@ -11,28 +11,20 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-
-      - name: Restore
-        run: dotnet restore RestfulTweaksShopRefreshFix.csproj
-
       - name: Build
-        run: dotnet build RestfulTweaksShopRefreshFix.csproj --configuration Release --no-restore
-
+        run: dotnet build RestfulTweaksShopRefreshFix.csproj --configuration Release
       - name: Collect DLL
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifact | Out-Null
-          Copy-Item "bin/Release/netstandard2.0/RestfulTweaksShopRefreshFix.dll" "artifact/RestfulTweaksShopRefreshFix.dll"
-
+          Copy-Item "bin/Release/net48/RestfulTweaksShopRefreshFix.dll" "artifact/RestfulTweaksShopRefreshFix.dll"
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
