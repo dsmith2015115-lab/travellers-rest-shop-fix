@@ -9,26 +9,28 @@ using UnityEngine;
 
 namespace TravellersRest.ShopRefreshFix
 {
-    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Compatibility", "2.0.0")]
+    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Compatibility", "2.0.1")]
     [BepInDependency("net.nep.bepinex.restfultweaks", BepInDependency.DependencyFlags.HardDependency)]
     public sealed class Plugin : BaseUnityPlugin
     {
         private const string HarmonyId = "dsmith.travellersrest.restfultweaks.shoprefreshfix";
         private static ManualLogSource Log;
         private static Type RestfulPluginType;
-        private static readonly Dictionary<object, ShopSnapshot> ShopSnapshots = new Dictionary<object, ShopSnapshot>(ReferenceComparer.Instance);
-        private static readonly Dictionary<object, ItemSnapshot> ItemSnapshots = new Dictionary<object, ItemSnapshot>(ReferenceComparer.Instance);
-
+        private static bool DatabaseReady;
+        private static bool ConfigInitialized;
+        private static bool LastDaily;
+        private static bool LastAllItems;
+        private static bool LastUnlimited;
         private float nextConfigCheck;
-        private static bool lastDaily;
-        private static bool lastAllItems;
-        private static bool lastUnlimited;
-        private static bool configInitialized;
+
+        private static readonly Dictionary<object, ShopSnapshot> ShopSnapshots =
+            new Dictionary<object, ShopSnapshot>(ReferenceComparer.Instance);
+        private static readonly Dictionary<object, ItemSnapshot> ItemSnapshots =
+            new Dictionary<object, ItemSnapshot>(ReferenceComparer.Instance);
 
         private void Awake()
         {
             Log = Logger;
-
             try
             {
                 Harmony harmony = new Harmony(HarmonyId);
@@ -59,8 +61,8 @@ namespace TravellersRest.ShopRefreshFix
                     Log.LogWarning("Current ShopDatabaseAccessor.Awake() was not found.");
                 }
 
-                ReadAndApplyConfig(false);
-                Log.LogInfo("Shop compatibility v2.0.0 active: Update Stock Daily / All Items / Unlimited Items / Refresh Shops hotkey use the current shop API. No UI polling or vendor lifecycle hooks are used.");
+                // Important: do NOT touch GetAllShops here. The game database does not exist yet.
+                Log.LogInfo("Shop compatibility v2.0.1 loaded; waiting for ShopDatabaseAccessor.Awake() before reading shop data.");
             }
             catch (Exception e)
             {
@@ -70,11 +72,10 @@ namespace TravellersRest.ShopRefreshFix
 
         private void Update()
         {
-            if (Time.unscaledTime < nextConfigCheck)
+            if (!DatabaseReady || Time.unscaledTime < nextConfigCheck)
                 return;
 
             nextConfigCheck = Time.unscaledTime + 0.75f;
-
             try
             {
                 ReadAndApplyConfig(true);
@@ -87,8 +88,14 @@ namespace TravellersRest.ShopRefreshFix
 
         private static void ShopDatabaseAwakePostfix()
         {
+            DatabaseReady = true;
+            ConfigInitialized = false;
+            ShopSnapshots.Clear();
+            ItemSnapshots.Clear();
+
             try
             {
+                Log.LogInfo("Shop database initialized; applying Restful Tweaks shop settings now.");
                 ReadAndApplyConfig(false);
             }
             catch (Exception e)
@@ -99,8 +106,15 @@ namespace TravellersRest.ShopRefreshFix
 
         private static bool ShopRefreshPrefix()
         {
+            if (!DatabaseReady)
+            {
+                Log.LogWarning("Refresh Shops requested before the shop database was ready; request ignored safely.");
+                return false;
+            }
+
             try
             {
+                ReadAndApplyConfig(false);
                 ApplySettingsToAllShops();
                 RefreshAllLimitedShops();
             }
@@ -108,12 +122,14 @@ namespace TravellersRest.ShopRefreshFix
             {
                 Log.LogError("Modern shop refresh failed: " + Unwrap(e));
             }
-
             return false;
         }
 
         private static void ReadAndApplyConfig(bool refreshOnChange)
         {
+            if (!DatabaseReady)
+                return;
+
             if (RestfulPluginType == null)
                 RestfulPluginType = FindRestfulPluginType();
             if (RestfulPluginType == null)
@@ -123,18 +139,17 @@ namespace TravellersRest.ShopRefreshFix
             bool allItems = ReadConfigBool("_shopAllItems");
             bool unlimited = ReadConfigBool("_shopMoreItems");
 
-            bool changed = !configInitialized || daily != lastDaily || allItems != lastAllItems || unlimited != lastUnlimited;
+            bool changed = !ConfigInitialized || daily != LastDaily || allItems != LastAllItems || unlimited != LastUnlimited;
             if (!changed)
                 return;
 
-            bool first = !configInitialized;
-            configInitialized = true;
-            lastDaily = daily;
-            lastAllItems = allItems;
-            lastUnlimited = unlimited;
+            bool first = !ConfigInitialized;
+            LastDaily = daily;
+            LastAllItems = allItems;
+            LastUnlimited = unlimited;
+            ConfigInitialized = true;
 
             ApplySettingsToAllShops();
-
             Log.LogInfo("Restful Tweaks shop settings applied: Update Stock Daily=" + daily +
                         ", All Items=" + allItems + ", Unlimited Items=" + unlimited + ".");
 
@@ -147,13 +162,12 @@ namespace TravellersRest.ShopRefreshFix
 
         private static bool ReadConfigBool(string fieldName)
         {
-            FieldInfo field = RestfulPluginType.GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
-            if (field == null)
-                return false;
+            FieldInfo field = RestfulPluginType.GetField(fieldName,
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
+            if (field == null) return false;
 
             object entry = field.GetValue(null);
-            if (entry == null)
-                return false;
+            if (entry == null) return false;
 
             PropertyInfo value = entry.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
             if (value != null && value.PropertyType == typeof(bool))
@@ -163,77 +177,49 @@ namespace TravellersRest.ShopRefreshFix
             if (boxed != null)
             {
                 object v = boxed.GetValue(entry, null);
-                if (v is bool)
-                    return (bool)v;
+                if (v is bool) return (bool)v;
             }
-
             return false;
         }
 
         private static void ApplySettingsToAllShops()
         {
             List<object> shops = GetAllShops();
-            if (shops == null)
-                return;
-
             int changedShops = 0;
             int changedItems = 0;
 
             foreach (object shop in shops)
             {
-                if (shop == null)
-                    continue;
+                if (shop == null) continue;
 
                 CaptureShopSnapshot(shop);
-                bool shopChanged = ApplyDailySetting(shop, lastDaily);
+                if (ApplyDailySetting(shop, LastDaily)) changedShops++;
 
-                object shopItems = GetMemberValue(shop, "shopItems");
-                if (shopItems is IEnumerable enumerable)
+                object items = GetMemberValue(shop, "shopItems");
+                if (!(items is IEnumerable enumerable)) continue;
+
+                foreach (object item in enumerable)
                 {
-                    foreach (object item in enumerable)
-                    {
-                        if (item == null)
-                            continue;
-
-                        CaptureItemSnapshot(item);
-                        bool itemChanged = false;
-                        itemChanged |= SetBoolMember(item, "alwaysAppear", lastAllItems ? true : ItemSnapshots[item].AlwaysAppear);
-                        itemChanged |= SetBoolMember(item, "unlimited", lastUnlimited ? true : ItemSnapshots[item].Unlimited);
-                        if (itemChanged)
-                            changedItems++;
-                    }
+                    if (item == null) continue;
+                    CaptureItemSnapshot(item);
+                    bool changed = false;
+                    changed |= SetBoolMember(item, "alwaysAppear", LastAllItems ? true : ItemSnapshots[item].AlwaysAppear);
+                    changed |= SetBoolMember(item, "unlimited", LastUnlimited ? true : ItemSnapshots[item].Unlimited);
+                    if (changed) changedItems++;
                 }
-
-                if (shopChanged)
-                    changedShops++;
             }
 
-            Log.LogInfo("Applied current shop settings to " + shops.Count + " shop record(s); changed shop records=" + changedShops + ", changed item records=" + changedItems + ".");
+            Log.LogInfo("Applied current shop settings to " + shops.Count + " shop record(s); changed shop records=" +
+                        changedShops + ", changed item records=" + changedItems + ".");
         }
 
         private static bool ApplyDailySetting(object shop, bool enabled)
         {
-            ShopSnapshot snapshot = ShopSnapshots[shop];
             object current = GetMemberValue(shop, "updateDays");
-            if (current == null)
-                return false;
+            if (current == null) return false;
 
-            Type listType = current.GetType();
-            object replacement;
-
-            if (enabled)
-            {
-                replacement = CreateEveryDayList(listType);
-                if (replacement == null)
-                    return false;
-            }
-            else
-            {
-                replacement = CloneList(snapshot.UpdateDays);
-                if (replacement == null)
-                    replacement = snapshot.UpdateDays;
-            }
-
+            object replacement = enabled ? CreateEveryDayList(current.GetType()) : CloneList(ShopSnapshots[shop].UpdateDays);
+            if (replacement == null) return false;
             return SetMemberValue(shop, "updateDays", replacement);
         }
 
@@ -243,45 +229,29 @@ namespace TravellersRest.ShopRefreshFix
             {
                 object list = Activator.CreateInstance(listType);
                 IList ilist = list as IList;
-                if (ilist == null)
-                    return null;
+                if (ilist == null) return null;
 
                 Type[] args = listType.IsGenericType ? listType.GetGenericArguments() : Type.EmptyTypes;
-                if (args.Length != 1 || !args[0].IsEnum)
-                    return null;
+                if (args.Length != 1 || !args[0].IsEnum) return null;
 
-                Type dayType = args[0];
-                string[] days = { "Mon", "Tue", "Wed", "Thurs", "Fri", "Sat", "Sun" };
-                foreach (string day in days)
+                foreach (string day in new[] { "Mon", "Tue", "Wed", "Thurs", "Fri", "Sat", "Sun" })
                 {
-                    try { ilist.Add(Enum.Parse(dayType, day, true)); }
-                    catch { }
+                    try { ilist.Add(Enum.Parse(args[0], day, true)); } catch { }
                 }
-
                 return list;
             }
-            catch
-            {
-                return null;
-            }
+            catch { return null; }
         }
 
         private static void CaptureShopSnapshot(object shop)
         {
-            if (ShopSnapshots.ContainsKey(shop))
-                return;
-
-            ShopSnapshots[shop] = new ShopSnapshot
-            {
-                UpdateDays = CloneList(GetMemberValue(shop, "updateDays"))
-            };
+            if (ShopSnapshots.ContainsKey(shop)) return;
+            ShopSnapshots[shop] = new ShopSnapshot { UpdateDays = CloneList(GetMemberValue(shop, "updateDays")) };
         }
 
         private static void CaptureItemSnapshot(object item)
         {
-            if (ItemSnapshots.ContainsKey(item))
-                return;
-
+            if (ItemSnapshots.ContainsKey(item)) return;
             ItemSnapshots[item] = new ItemSnapshot
             {
                 AlwaysAppear = ReadBoolMember(item, "alwaysAppear"),
@@ -291,31 +261,22 @@ namespace TravellersRest.ShopRefreshFix
 
         private static object CloneList(object source)
         {
-            if (!(source is IEnumerable enumerable))
-                return source;
-
+            if (!(source is IEnumerable enumerable)) return source;
             try
             {
                 object clone = Activator.CreateInstance(source.GetType());
                 IList list = clone as IList;
-                if (list == null)
-                    return source;
-
-                foreach (object value in enumerable)
-                    list.Add(value);
+                if (list == null) return source;
+                foreach (object value in enumerable) list.Add(value);
                 return clone;
             }
-            catch
-            {
-                return source;
-            }
+            catch { return source; }
         }
 
         private static void RefreshAllLimitedShops()
         {
             Type accessorType = FindType("ShopDatabaseAccessor");
-            if (accessorType == null)
-                throw new MissingMemberException("ShopDatabaseAccessor not found");
+            if (accessorType == null) throw new MissingMemberException("ShopDatabaseAccessor not found");
 
             object accessor = FindInstance(accessorType);
             List<object> shops = GetAllShops();
@@ -324,10 +285,9 @@ namespace TravellersRest.ShopRefreshFix
 
             foreach (object shop in shops)
             {
-                if (shop == null || !ReadBoolMember(shop, "limitedItems"))
-                    continue;
-
+                if (shop == null || !ReadBoolMember(shop, "limitedItems")) continue;
                 limited++;
+
                 MethodInfo create = FindCreateNewShopList(accessorType, shop.GetType());
                 if (create == null)
                 {
@@ -335,8 +295,7 @@ namespace TravellersRest.ShopRefreshFix
                     continue;
                 }
 
-                object[] args = BuildArguments(create, shop);
-                create.Invoke(create.IsStatic ? null : accessor, args);
+                create.Invoke(create.IsStatic ? null : accessor, BuildArguments(create, shop));
                 refreshed++;
             }
 
@@ -345,14 +304,14 @@ namespace TravellersRest.ShopRefreshFix
 
         private static List<object> GetAllShops()
         {
+            if (!DatabaseReady) return new List<object>();
+
             Type accessorType = FindType("ShopDatabaseAccessor");
-            if (accessorType == null)
-                return new List<object>();
+            if (accessorType == null) return new List<object>();
 
             object accessor = FindInstance(accessorType);
             MethodInfo getAll = FindZeroArgMethod(accessorType, "GetAllShops");
-            if (getAll == null)
-                return new List<object>();
+            if (getAll == null) return new List<object>();
 
             object result = getAll.Invoke(getAll.IsStatic ? null : accessor, null);
             return Values(result);
@@ -363,35 +322,25 @@ namespace TravellersRest.ShopRefreshFix
             MethodInfo best = null;
             foreach (MethodInfo method in accessorType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
             {
-                if (method.Name != "CreateNewShopList")
-                    continue;
-
-                ParameterInfo[] parameters = method.GetParameters();
-                if (parameters.Length == 0)
-                    continue;
-
-                Type first = parameters[0].ParameterType;
-                if (!first.IsAssignableFrom(shopType) && !shopType.IsAssignableFrom(first))
-                    continue;
-
-                if (best == null || parameters.Length < best.GetParameters().Length)
-                    best = method;
+                if (method.Name != "CreateNewShopList") continue;
+                ParameterInfo[] p = method.GetParameters();
+                if (p.Length == 0) continue;
+                if (!p[0].ParameterType.IsAssignableFrom(shopType) && !shopType.IsAssignableFrom(p[0].ParameterType)) continue;
+                if (best == null || p.Length < best.GetParameters().Length) best = method;
             }
             return best;
         }
 
         private static object[] BuildArguments(MethodInfo method, object shop)
         {
-            ParameterInfo[] parameters = method.GetParameters();
-            object[] args = new object[parameters.Length];
+            ParameterInfo[] p = method.GetParameters();
+            object[] args = new object[p.Length];
             args[0] = shop;
-
-            for (int i = 1; i < parameters.Length; i++)
+            for (int i = 1; i < p.Length; i++)
             {
-                ParameterInfo p = parameters[i];
-                if (p.HasDefaultValue) args[i] = p.DefaultValue;
-                else if (p.ParameterType == typeof(bool)) args[i] = false;
-                else if (p.ParameterType.IsValueType) args[i] = Activator.CreateInstance(p.ParameterType);
+                if (p[i].HasDefaultValue) args[i] = p[i].DefaultValue;
+                else if (p[i].ParameterType == typeof(bool)) args[i] = false;
+                else if (p[i].ParameterType.IsValueType) args[i] = Activator.CreateInstance(p[i].ParameterType);
                 else args[i] = null;
             }
             return args;
@@ -400,43 +349,21 @@ namespace TravellersRest.ShopRefreshFix
         private static object FindInstance(Type type)
         {
             BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
-
             foreach (PropertyInfo p in type.GetProperties(flags))
             {
-                if (p.GetIndexParameters().Length != 0 || !type.IsAssignableFrom(p.PropertyType))
-                    continue;
-                try
-                {
-                    object value = p.GetValue(null, null);
-                    if (value != null) return value;
-                }
-                catch { }
+                if (p.GetIndexParameters().Length != 0 || !type.IsAssignableFrom(p.PropertyType)) continue;
+                try { object v = p.GetValue(null, null); if (v != null) return v; } catch { }
             }
-
             foreach (FieldInfo f in type.GetFields(flags))
             {
-                if (!type.IsAssignableFrom(f.FieldType))
-                    continue;
-                try
-                {
-                    object value = f.GetValue(null);
-                    if (value != null) return value;
-                }
-                catch { }
+                if (!type.IsAssignableFrom(f.FieldType)) continue;
+                try { object v = f.GetValue(null); if (v != null) return v; } catch { }
             }
-
             foreach (MethodInfo m in type.GetMethods(flags))
             {
-                if (m.GetParameters().Length != 0 || !type.IsAssignableFrom(m.ReturnType))
-                    continue;
-                try
-                {
-                    object value = m.Invoke(null, null);
-                    if (value != null) return value;
-                }
-                catch { }
+                if (m.GetParameters().Length != 0 || !type.IsAssignableFrom(m.ReturnType)) continue;
+                try { object v = m.Invoke(null, null); if (v != null) return v; } catch { }
             }
-
             return null;
         }
 
@@ -445,19 +372,11 @@ namespace TravellersRest.ShopRefreshFix
             if (instance == null) return null;
             Type t = instance.GetType();
             BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-
-            FieldInfo field = t.GetField(name, flags);
-            if (field != null)
-            {
-                try { return field.GetValue(instance); } catch { }
-            }
-
-            PropertyInfo prop = t.GetProperty(name, flags);
-            if (prop != null && prop.CanRead && prop.GetIndexParameters().Length == 0)
-            {
-                try { return prop.GetValue(instance, null); } catch { }
-            }
-
+            FieldInfo f = t.GetField(name, flags);
+            if (f != null) { try { return f.GetValue(instance); } catch { } }
+            PropertyInfo p = t.GetProperty(name, flags);
+            if (p != null && p.CanRead && p.GetIndexParameters().Length == 0)
+            { try { return p.GetValue(instance, null); } catch { } }
             return null;
         }
 
@@ -465,28 +384,26 @@ namespace TravellersRest.ShopRefreshFix
         {
             Type t = instance.GetType();
             BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-
-            FieldInfo field = t.GetField(name, flags);
-            if (field != null)
+            FieldInfo f = t.GetField(name, flags);
+            if (f != null)
             {
                 try
                 {
-                    object current = field.GetValue(instance);
-                    if (ReferenceEquals(current, value)) return false;
-                    field.SetValue(instance, value);
+                    object current = f.GetValue(instance);
+                    if (Equals(current, value)) return false;
+                    f.SetValue(instance, value);
                     return true;
                 }
                 catch { }
             }
-
-            PropertyInfo prop = t.GetProperty(name, flags);
-            if (prop != null && prop.CanWrite)
+            PropertyInfo p = t.GetProperty(name, flags);
+            if (p != null && p.CanWrite)
             {
                 try
                 {
-                    object current = prop.CanRead ? prop.GetValue(instance, null) : null;
-                    if (ReferenceEquals(current, value)) return false;
-                    prop.SetValue(instance, value, null);
+                    object current = p.CanRead ? p.GetValue(instance, null) : null;
+                    if (Equals(current, value)) return false;
+                    p.SetValue(instance, value, null);
                     return true;
                 }
                 catch { }
@@ -496,36 +413,34 @@ namespace TravellersRest.ShopRefreshFix
 
         private static bool ReadBoolMember(object instance, string name)
         {
-            object value = GetMemberValue(instance, name);
-            return value is bool && (bool)value;
+            object v = GetMemberValue(instance, name);
+            return v is bool && (bool)v;
         }
 
         private static bool SetBoolMember(object instance, string name, bool value)
         {
             Type t = instance.GetType();
             BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-
-            FieldInfo field = t.GetField(name, flags);
-            if (field != null && field.FieldType == typeof(bool))
+            FieldInfo f = t.GetField(name, flags);
+            if (f != null && f.FieldType == typeof(bool))
             {
                 try
                 {
-                    bool current = (bool)field.GetValue(instance);
+                    bool current = (bool)f.GetValue(instance);
                     if (current == value) return false;
-                    field.SetValue(instance, value);
+                    f.SetValue(instance, value);
                     return true;
                 }
                 catch { }
             }
-
-            PropertyInfo prop = t.GetProperty(name, flags);
-            if (prop != null && prop.PropertyType == typeof(bool) && prop.CanWrite)
+            PropertyInfo p = t.GetProperty(name, flags);
+            if (p != null && p.PropertyType == typeof(bool) && p.CanWrite)
             {
                 try
                 {
-                    bool current = prop.CanRead && (bool)prop.GetValue(instance, null);
+                    bool current = p.CanRead && (bool)p.GetValue(instance, null);
                     if (current == value) return false;
-                    prop.SetValue(instance, value, null);
+                    p.SetValue(instance, value, null);
                     return true;
                 }
                 catch { }
@@ -535,9 +450,8 @@ namespace TravellersRest.ShopRefreshFix
 
         private static MethodInfo FindZeroArgMethod(Type type, string name)
         {
-            foreach (MethodInfo method in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
-                if (method.Name == name && method.GetParameters().Length == 0)
-                    return method;
+            foreach (MethodInfo m in type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+                if (m.Name == name && m.GetParameters().Length == 0) return m;
             return null;
         }
 
@@ -547,16 +461,13 @@ namespace TravellersRest.ShopRefreshFix
             {
                 string n = a.GetName().Name ?? "";
                 if (n.IndexOf("RestfulTweaks", StringComparison.OrdinalIgnoreCase) < 0 &&
-                    n.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) < 0)
-                    continue;
-
+                    n.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) < 0) continue;
                 try
                 {
-                    Type t = a.GetType("RestfulTweaks.Plugin", false);
-                    if (t != null) return t;
-                    foreach (Type candidate in a.GetTypes())
-                        if (candidate.Name == "Plugin" && candidate.Namespace == "RestfulTweaks")
-                            return candidate;
+                    Type direct = a.GetType("RestfulTweaks.Plugin", false);
+                    if (direct != null) return direct;
+                    foreach (Type t in a.GetTypes())
+                        if (t.Name == "Plugin" && t.Namespace == "RestfulTweaks") return t;
                 }
                 catch { }
             }
@@ -567,10 +478,8 @@ namespace TravellersRest.ShopRefreshFix
         {
             Type t = RestfulPluginType ?? FindRestfulPluginType();
             if (t == null) return null;
-
             foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
-                if (m.Name == "ShopRefresh" && m.ReturnType == typeof(void) && m.GetParameters().Length == 0)
-                    return m;
+                if (m.Name == "ShopRefresh" && m.ReturnType == typeof(void) && m.GetParameters().Length == 0) return m;
             return null;
         }
 
@@ -582,8 +491,7 @@ namespace TravellersRest.ShopRefreshFix
                 {
                     Type direct = a.GetType(name, false);
                     if (direct != null) return direct;
-                    foreach (Type t in a.GetTypes())
-                        if (t.Name == name) return t;
+                    foreach (Type t in a.GetTypes()) if (t.Name == name) return t;
                 }
                 catch { }
             }
@@ -594,25 +502,22 @@ namespace TravellersRest.ShopRefreshFix
         {
             List<object> result = new List<object>();
             if (source == null) return result;
-
             if (source is IDictionary dictionary)
             {
-                foreach (object value in dictionary.Values)
-                    if (value != null) result.Add(value);
+                foreach (object value in dictionary.Values) if (value != null) result.Add(value);
                 return result;
             }
-
             if (source is IEnumerable enumerable)
             {
                 foreach (object item in enumerable)
                 {
                     if (item == null) continue;
-                    PropertyInfo valueProp = item.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
-                    if (valueProp != null)
+                    PropertyInfo p = item.GetType().GetProperty("Value", BindingFlags.Public | BindingFlags.Instance);
+                    if (p != null)
                     {
                         try
                         {
-                            object value = valueProp.GetValue(item, null);
+                            object value = p.GetValue(item, null);
                             if (value != null) result.Add(value);
                             continue;
                         }
@@ -626,21 +531,12 @@ namespace TravellersRest.ShopRefreshFix
 
         private static Exception Unwrap(Exception e)
         {
-            while (e is TargetInvocationException && e.InnerException != null)
-                e = e.InnerException;
+            while (e is TargetInvocationException && e.InnerException != null) e = e.InnerException;
             return e;
         }
 
-        private sealed class ShopSnapshot
-        {
-            public object UpdateDays;
-        }
-
-        private sealed class ItemSnapshot
-        {
-            public bool AlwaysAppear;
-            public bool Unlimited;
-        }
+        private sealed class ShopSnapshot { public object UpdateDays; }
+        private sealed class ItemSnapshot { public bool AlwaysAppear; public bool Unlimited; }
 
         private sealed class ReferenceComparer : IEqualityComparer<object>
         {
