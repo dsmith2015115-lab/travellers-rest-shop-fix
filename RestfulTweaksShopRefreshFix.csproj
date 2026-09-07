@@ -8,9 +8,21 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
+
   <ItemGroup>
     <Compile Include="src/RestfulTweaksShopRefreshFix.cs" />
-    <PackageReference Include="BepInEx" Version="5.4.21" />
-    <PackageReference Include="BepInEx.Harmony" Version="2.5.1" />
+
+    <Reference Include="BepInEx">
+      <HintPath>libs\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="0Harmony">
+      <HintPath>libs\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- BepInEx 5.4.x itself is built against UnityEngine 5.6.1. -->
+    <PackageReference Include="UnityEngine" Version="5.6.1" IncludeAssets="compile" />
   </ItemGroup>
 </Project>
