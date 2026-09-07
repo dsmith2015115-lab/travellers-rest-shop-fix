@@ -8,7 +8,8 @@ using HarmonyLib;
 
 namespace TravellersRest.ShopRefreshFix
 {
-    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Refresh Fix", "1.0.0")]
+    [BepInPlugin("dsmith.travellersrest.restfultweaks.shoprefreshfix", "Restful Tweaks Shop Refresh Fix", "1.1.0")]
+    [BepInDependency("net.nep.bepinex.restfultweaks", BepInDependency.DependencyFlags.HardDependency)]
     public sealed class Plugin : BaseUnityPlugin
     {
         private static ManualLogSource Log;
@@ -19,33 +20,83 @@ namespace TravellersRest.ShopRefreshFix
             try
             {
                 MethodBase target = FindShopRefresh();
-                if (target == null) { Log.LogError("Restful Tweaks ShopRefresh() not found."); return; }
+                if (target == null)
+                {
+                    Log.LogError("Restful Tweaks is loaded, but ShopRefresh() still was not found. Dumping candidate methods.");
+                    DumpShopCandidates();
+                    return;
+                }
+
                 new Harmony("dsmith.travellersrest.restfultweaks.shoprefreshfix").Patch(
                     target,
                     prefix: new HarmonyMethod(typeof(Plugin).GetMethod("Prefix", BindingFlags.NonPublic | BindingFlags.Static)));
-                Log.LogInfo("Shop refresh compatibility fix loaded.");
+
+                Log.LogInfo("Shop refresh compatibility fix loaded after Restful Tweaks. Patched " +
+                    target.DeclaringType.FullName + "." + target.Name + ".");
             }
-            catch (Exception e) { Log.LogError(e); }
+            catch (Exception e)
+            {
+                Log.LogError("Failed to install shop refresh compatibility patch: " + e);
+            }
         }
 
-        private static MethodBase FindShopRefresh()
+        private static IEnumerable<Assembly> RestfulTweaksAssemblies()
         {
             foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
             {
                 string n = a.GetName().Name ?? "";
-                if (n.IndexOf("RestfulTweaks", StringComparison.OrdinalIgnoreCase) < 0 &&
-                    n.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (n.IndexOf("RestfulTweaks", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    n.IndexOf("RestFulTweaks", StringComparison.OrdinalIgnoreCase) >= 0)
+                    yield return a;
+            }
+        }
+
+        private static MethodBase FindShopRefresh()
+        {
+            foreach (Assembly a in RestfulTweaksAssemblies())
+            {
                 try
                 {
                     foreach (Type t in a.GetTypes())
                     {
-                        MethodInfo m = t.GetMethod("ShopRefresh", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance, null, Type.EmptyTypes, null);
-                        if (m != null && m.ReturnType == typeof(void)) return m;
+                        foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+                        {
+                            if (m.ReturnType != typeof(void) || m.GetParameters().Length != 0)
+                                continue;
+
+                            if (string.Equals(m.Name, "ShopRefresh", StringComparison.OrdinalIgnoreCase) ||
+                                m.Name.IndexOf("ShopRefresh", StringComparison.OrdinalIgnoreCase) >= 0)
+                                return m;
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log.LogWarning("Could not scan Restful Tweaks assembly " + a.GetName().Name + ": " + e.Message);
+                }
+            }
+            return null;
+        }
+
+        private static void DumpShopCandidates()
+        {
+            foreach (Assembly a in RestfulTweaksAssemblies())
+            {
+                try
+                {
+                    foreach (Type t in a.GetTypes())
+                    {
+                        foreach (MethodInfo m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+                        {
+                            string full = (t.FullName ?? t.Name) + "." + m.Name;
+                            if (full.IndexOf("shop", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                full.IndexOf("refresh", StringComparison.OrdinalIgnoreCase) >= 0)
+                                Log.LogInfo("Shop candidate: " + full + " (params=" + m.GetParameters().Length + ", return=" + m.ReturnType.Name + ")");
+                        }
                     }
                 }
                 catch { }
             }
-            return null;
         }
 
         private static bool Prefix()
